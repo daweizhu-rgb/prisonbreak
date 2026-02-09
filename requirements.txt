@@ -1,0 +1,4 @@
+[Environment]::SetEnvironmentVariable("ANTHROPIC_API_KEY", "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", "User")
+$env:ANTHROPIC_API_KEY = "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"
+
+pygame>=2.5.0

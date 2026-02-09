@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>警察与逃犯</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0a0a1e; display: flex; justify-content: center; align-items: center; min-height: 100vh; touch-action: none; }
+    #wrap { position: relative; max-width: 100%; }
+    #game { display: block; width: 100%; max-width: 960px; height: auto; background: #0a0a1e; }
+    #touch { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+    #touch .btn { position: absolute; width: 20%; min-width: 60px; height: 22%; min-height: 80px; pointer-events: auto; opacity: 0.35; border-radius: 8px; }
+    #touch .btn:active { opacity: 0.6; background: rgba(200,200,200,0.3); }
+    #left { left: 2%; bottom: 18%; }
+    #right { left: 24%; bottom: 18%; }
+    #up { right: 24%; bottom: 18%; }
+    #down { right: 2%; bottom: 18%; }
+    #jump { right: 2%; top: 15%; width: 18%; min-width: 56px; }
+    #ui { position: absolute; left: 0; top: 0; right: 0; padding: 8px 12px; color: #e6e6e6; font: 16px/1.4 sans-serif; pointer-events: none; }
+    #restartWrap { position: absolute; left: 0; right: 0; bottom: 0; height: 22%; display: flex; justify-content: center; align-items: center; pointer-events: none; }
+    #restartWrap.active { pointer-events: auto; }
+    #restart { padding: 10px 24px; font-size: 18px; background: #c8c8b4; color: #1a1a1a; border: 2px solid #e6e6e6; border-radius: 6px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="960" height="640"></canvas>
+    <div id="touch">
+      <div id="left" class="btn" data-key="Left"></div>
+      <div id="right" class="btn" data-key="Right"></div>
+      <div id="up" class="btn" data-key="Up"></div>
+      <div id="down" class="btn" data-key="Down"></div>
+      <div id="jump" class="btn" data-key="Space"></div>
+    </div>
+    <div id="ui"></div>
+    <div id="restartWrap"><button id="restart" style="display:none">Restart</button></div>
+  </div>
+  <script>
+(function() {
+  const CW = 960, CH = 640;
+  const FLOOR_COUNT = 5, MARGIN_TOP = 80, MARGIN_BOTTOM = 80;
+  const FLOOR_Y = (i) => CH - MARGIN_BOTTOM - i * ((CH - MARGIN_TOP - MARGIN_BOTTOM) / (FLOOR_COUNT - 1));
+  const PRISONER_W = 22, PRISONER_H = 30, POLICE_W = 26, POLICE_H = 38;
+  const PRISONER_SPEED = 240, PRISONER_LADDER = 240;
+  const POLICE_PATROL_SPEED = 80, POLICE_CHASE_SPEED = 160, POLICE_LADDER = 80;
+  const SLIDE_SPEED = 400, GRAVITY = 400, JUMP_VY0 = Math.sqrt(2 * GRAVITY * PRISONER_H * 2);
+  const BULLET_SPEED = PRISONER_SPEED, BULLET_W = 12, BULLET_H = 6, POLICE_COOLDOWN = 10;
+  const POLICE_SHOOT_MIN_DISTANCE = 10, INTEL_EXPIRE_TIME = 5.0;
+  const WIN_TIME = 60, SLIDE_CHANGE = 30, LADDER_WIDTH = 18, FLOOR_TOLERANCE = 10;
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const ui = document.getElementById('ui');
+  const restartBtn = document.getElementById('restart');
+  const restartWrap = document.getElementById('restartWrap');
+
+  let keys = {};
+  let ladders = [], slideStartX = 100, slideEndX = 100;
+  let prisoner = null, police = [], bullets = [];
+  let gameOver = false, winnerText = '', elapsed = 0, startTime = 0, lastSlideTime = 0;
+  let lastTick = 0, scale = 1;
+  let lastKnownPrisonerFloor = null, lastKnownPrisonerX = null, lastIntelUpdateTime = -999;
+
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function resumeAudio() { try { audioCtx.resume(); } catch (_) {} }
+  document.addEventListener('keydown', resumeAudio, { once: true });
+  document.addEventListener('click', resumeAudio, { once: true });
+
+  function playShoot() {
+    try {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.connect(g); g.connect(audioCtx.destination);
+      o.frequency.value = 600; o.type = 'square';
+      g.gain.setValueAtTime(0.12, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.08);
+      o.start(audioCtx.currentTime); o.stop(audioCtx.currentTime + 0.08);
+    } catch (_) {}
+  }
+  function playHit() {
+    try {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.connect(g); g.connect(audioCtx.destination);
+      o.frequency.setValueAtTime(150, audioCtx.currentTime);
+      o.frequency.linearRampToValueAtTime(80, audioCtx.currentTime + 0.2);
+      o.type = 'sawtooth';
+      g.gain.setValueAtTime(0.15, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+      o.start(audioCtx.currentTime); o.stop(audioCtx.currentTime + 0.2);
+    } catch (_) {}
+  }
+  let lastLadderSound = 0;
+  const LADDER_SOUND_INTERVAL = 0.14;
+  function playLadder(t) {
+    if (t - lastLadderSound < LADDER_SOUND_INTERVAL) return;
+    lastLadderSound = t;
+    try {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.connect(g); g.connect(audioCtx.destination);
+      o.frequency.value = 320; o.type = 'square';
+      g.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.06);
+      o.start(audioCtx.currentTime); o.stop(audioCtx.currentTime + 0.06);
+    } catch (_) {}
+  }
+  function playSlide() {
+    try {
+      const o = audioCtx.createOscillator();
+      const g = audioCtx.createGain();
+      o.connect(g); g.connect(audioCtx.destination);
+      o.frequency.setValueAtTime(180, audioCtx.currentTime);
+      o.frequency.linearRampToValueAtTime(100, audioCtx.currentTime + 0.5);
+      o.type = 'sawtooth';
+      g.gain.setValueAtTime(0.06, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.5);
+      o.start(audioCtx.currentTime); o.stop(audioCtx.currentTime + 0.5);
+    } catch (_) {}
+  }
+  function playWin() {
+    try {
+      [523, 659, 784].forEach((freq, i) => {
+        const o = audioCtx.createOscillator();
+        const g = audioCtx.createGain();
+        o.connect(g); g.connect(audioCtx.destination);
+        o.frequency.value = freq; o.type = 'sine';
+        const t = audioCtx.currentTime + i * 0.15;
+        g.gain.setValueAtTime(0, t);
+        g.gain.linearRampToValueAtTime(0.12, t + 0.05);
+        g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
+        o.start(t); o.stop(t + 0.2);
+      });
+    } catch (_) {}
+  }
+
+  function rect(x, y, w, h) { return { x, y, w, h, get left() { return this.x; }, get right() { return this.x + this.w; }, get top() { return this.y; }, get bottom() { return this.y + this.h; }, get centerx() { return this.x + this.w/2; }, get centery() { return this.y + this.h/2; }, set midbottom(p) { this.x = p[0] - this.w/2; this.y = p[1] - this.h; }, set centerx(v) { this.x = v - this.w/2; }, set bottom(v) { this.y = v - this.h; }, set top(v) { this.y = v; }, copy() { return rect(this.x, this.y, this.w, this.h); }, colliderect(r) { return this.x < r.x + r.w && this.x + this.w > r.x && this.y < r.y + r.h && this.y + this.h > r.y; } }; }
+
+  function initLadders() {
+    const xs = [];
+    for (let i = 0; i < 9; i++) xs.push(100 + Math.random() * (CW - 200 - 100));
+    xs.sort((a,b)=>a-b);
+    const span = (CW - 200) / 9;
+    for (let i = 0; i < 9; i++) xs[i] = 100 + i * span + Math.random() * (span - LADDER_WIDTH);
+    ladders = [
+      { x: xs[0], from: 1, to: 2 }, { x: xs[1], from: 2, to: 3 }, { x: xs[2], from: 3, to: 4 }, { x: xs[3], from: 4, to: 5 },
+      { x: xs[4], from: 1, to: 3 }, { x: xs[5], from: 2, to: 4 }, { x: xs[6], from: 3, to: 5 },
+      { x: xs[7], from: 1, to: 4 }, { x: xs[8], from: 2, to: 5 }
+    ];
+  }
+
+  function ladderRect(l) {
+    const y1 = FLOOR_Y(l.from - 1), y2 = FLOOR_Y(l.to - 1);
+    return { left: l.x - LADDER_WIDTH/2, right: l.x + LADDER_WIDTH/2, top: Math.min(y1, y2), bottom: Math.max(y1, y2), centerx: l.x };
+  }
+
+  function createPrisoner() {
+    const floor = 4;
+    const r = rect(0, 0, PRISONER_W, PRISONER_H);
+    r.midbottom = [CW - 50, FLOOR_Y(floor)];
+    return { rect: r, floor, vx: 0, vy: 0, on_ladder: false, climbing: null, sliding: false, slide_t: 0, jump_vy: 0 };
+  }
+
+  function createPolice() {
+    // A 在 3 楼，B 在 2 楼，C 在 1 楼，均在左侧
+    // A巡逻3-4-5楼（初始目标3楼），B巡逻2-3-4楼（初始目标2楼），C巡逻1-2-3楼（初始目标1楼）
+    const positions = [{ f: 2, x: 60, initialTarget: 3 }, { f: 1, x: 100, initialTarget: 2 }, { f: 0, x: 140, initialTarget: 1 }];
+    return positions.map(({ f, x, initialTarget }, i) => {
+      const r = rect(0, 0, POLICE_W, POLICE_H);
+      r.midbottom = [x, FLOOR_Y(f)];
+      return {
+        rect: r, floor: f, vx: 0, vy: 0, on_ladder: false, climbing: null, last_shot: -POLICE_COOLDOWN,
+        mode: 'patrol',
+        patrolDir: 1,
+        cSearchTarget: initialTarget, cSearchGoingUp: true
+      };
+    });
+  }
+
+  function getFloorBelowY(bottomY) {
+    for (let k = FLOOR_COUNT - 1; k >= 0; k--)
+      if (FLOOR_Y(k) >= bottomY) return k;
+    return 0;
+  }
+
+  function updatePrisoner(pr, dt, t) {
+    if (pr.sliding) {
+      pr.vx = 0; pr.vy = 0;
+      const sy0 = FLOOR_Y(4), sy1 = FLOOR_Y(0);
+      const len = Math.hypot(slideEndX - slideStartX, sy1 - sy0) || 1;
+      pr.slide_t += (SLIDE_SPEED * dt) / len;
+      if (pr.slide_t >= 1) { pr.slide_t = 1; pr.sliding = false; }
+      const x = slideStartX + (slideEndX - slideStartX) * pr.slide_t;
+      const y = sy0 + (sy1 - sy0) * pr.slide_t;
+      pr.rect.midbottom = [x, y];
+      let best = 0, bestD = 1e9;
+      for (let i = 0; i < FLOOR_COUNT; i++) { const d = Math.abs(y - FLOOR_Y(i)); if (d < bestD) { bestD = d; best = i; } }
+      pr.floor = best;
+      return;
+    }
+
+    pr.vx = keys['ArrowLeft'] ? -PRISONER_SPEED : (keys['ArrowRight'] ? PRISONER_SPEED : 0);
+    pr.vy = 0;
+
+    if (pr.on_ladder && pr.climbing) {
+      if (keys['ArrowUp']) pr.vy = -PRISONER_LADDER;
+      else if (keys['ArrowDown']) pr.vy = PRISONER_LADDER;
+      if (pr.vy !== 0) playLadder(t);
+      const lr = ladderRect(pr.climbing);
+      const wantMoveH = keys['ArrowLeft'] || keys['ArrowRight'];
+      if (wantMoveH) {
+        const curFloor = getFloorBelowY(pr.rect.bottom);
+        let landed = false;
+        for (const l of ladders) {
+          if (l.x === pr.climbing.x) continue;
+          if (Math.abs(pr.rect.centerx - l.x) > LADDER_WIDTH/2 + pr.rect.w/2) continue;
+          const lo = Math.min(l.from, l.to), hi = Math.max(l.from, l.to);
+          if (curFloor + 1 < lo || curFloor + 1 > hi) continue;
+          pr.climbing = l;
+          pr.rect.centerx = l.x;
+          landed = true;
+          break;
+        }
+        if (!landed && curFloor === 4) {
+          const ex = slideStartX, ew = 60, ey = FLOOR_Y(4) - 70;
+          if (pr.rect.x + pr.rect.w >= ex - ew/2 && pr.rect.x <= ex + ew/2 && pr.rect.bottom >= ey && pr.rect.top <= ey + 80) {
+            pr.sliding = true; pr.slide_t = 0; pr.jump_vy = 0; pr.on_ladder = false; pr.climbing = null;
+            playSlide();
+            return;
+          }
+        }
+        if (!landed) {
+          pr.floor = getFloorBelowY(pr.rect.bottom);
+          pr.rect.bottom = FLOOR_Y(pr.floor);
+          pr.on_ladder = false;
+          pr.climbing = null;
+          pr.jump_vy = 0;
+        }
+      } else {
+        pr.rect.centerx = lr.centerx;
+        pr.rect.y += pr.vy * dt;
+        const l = pr.climbing;
+        const lTop = Math.min(FLOOR_Y(l.from - 1), FLOOR_Y(l.to - 1)), lBottom = Math.max(FLOOR_Y(l.from - 1), FLOOR_Y(l.to - 1));
+        const minTop = lTop - pr.rect.h, maxTop = lBottom - pr.rect.h;
+        pr.rect.top = Math.max(minTop, Math.min(maxTop, pr.rect.top));
+        const passes = [];
+        for (let k = Math.min(l.from, l.to) - 1; k <= Math.max(l.from, l.to) - 1; k++) passes.push(k);
+        const wantOff = !keys['ArrowUp'] && !keys['ArrowDown'];
+        if (wantOff) {
+          for (const k of passes) {
+            const fy = FLOOR_Y(k);
+            if (Math.abs(pr.rect.bottom - fy) <= FLOOR_TOLERANCE) {
+              pr.rect.bottom = fy; pr.floor = k; pr.on_ladder = false; pr.climbing = null;
+              break;
+            }
+          }
+        }
+        const topFloor = Math.max(l.from, l.to) - 1, bottomFloor = Math.min(l.from, l.to) - 1;
+        if (pr.vy < 0) {
+          const targetY = FLOOR_Y(topFloor) - pr.rect.h;
+          if (pr.rect.top <= targetY) { pr.rect.top = targetY; pr.floor = topFloor; pr.on_ladder = false; pr.climbing = null; }
+        } else if (pr.vy > 0) {
+          const floorY = FLOOR_Y(bottomFloor);
+          if (pr.rect.bottom >= floorY - FLOOR_TOLERANCE) {
+            pr.rect.bottom = floorY;
+            pr.floor = bottomFloor;
+            pr.on_ladder = false;
+            pr.climbing = null;
+          }
+        }
+      }
+      pr.rect.x = Math.max(0, Math.min(CW - pr.rect.w, pr.rect.x));
+      return;
+    }
+
+    if (pr.jump_vy !== 0) {
+      pr.jump_vy -= GRAVITY * dt;
+      pr.rect.y -= pr.jump_vy * dt;
+      pr.rect.x = Math.max(0, Math.min(CW - pr.rect.w, pr.rect.x + pr.vx * dt));
+      for (let k = pr.floor; k >= 0; k--) {
+        const fy = FLOOR_Y(k);
+        if (pr.rect.bottom >= fy) {
+          pr.rect.bottom = fy;
+          pr.floor = k;
+          pr.jump_vy = 0;
+          break;
+        }
+      }
+      return;
+    }
+
+    const onGround = !pr.on_ladder && !pr.sliding && pr.jump_vy === 0;
+    if ((keys[' '] || keys['Space']) && onGround) pr.jump_vy = JUMP_VY0;
+
+    pr.rect.x = Math.max(0, Math.min(CW - pr.rect.w, pr.rect.x + pr.vx * dt));
+
+    for (const l of ladders) {
+      const lo = Math.min(l.from, l.to) - 1, hi = Math.max(l.from, l.to) - 1;
+      if (pr.floor < lo || pr.floor > hi) continue;
+      const lr = ladderRect(l);
+      const cx = pr.rect.x + pr.rect.w / 2;
+      if (cx < lr.left || cx > lr.right) continue;
+      if (keys['ArrowUp'] && hi > pr.floor) {
+        pr.on_ladder = true; pr.climbing = l; pr.vy = -PRISONER_LADDER; pr.jump_vy = 0;
+        pr.rect.centerx = l.x;
+        break;
+      }
+      if (keys['ArrowDown'] && lo < pr.floor) {
+        pr.on_ladder = true; pr.climbing = l; pr.vy = PRISONER_LADDER; pr.jump_vy = 0;
+        pr.rect.centerx = l.x;
+        break;
+      }
+    }
+
+    if (!pr.on_ladder) pr.rect.bottom = FLOOR_Y(pr.floor);
+
+    if (pr.floor === 4) {
+      const ex = slideStartX, ew = 60, ey = FLOOR_Y(4) - 70;
+      if (keys['ArrowDown'] && pr.rect.x + pr.rect.w >= ex - ew/2 && pr.rect.x <= ex + ew/2 && pr.rect.bottom >= ey && pr.rect.top <= ey + 80) {
+        pr.sliding = true; pr.slide_t = 0; pr.jump_vy = 0;
+        playSlide();
+      }
+    }
+  }
+
+  function policeSeesPrisoner(p, pr) {
+    if (p.floor === pr.floor) return true;
+    for (const l of ladders) {
+      const lr = ladderRect(l);
+      if (Math.abs(p.rect.centerx - lr.centerx) > LADDER_WIDTH + 4) continue;
+      if (Math.abs(pr.rect.centerx - lr.centerx) > LADDER_WIDTH + 4) continue;
+      const lo = Math.min(l.from, l.to) - 1;  // 转换为 0-based
+      const hi = Math.max(l.from, l.to) - 1;
+      if (lo <= p.floor && p.floor <= hi && lo <= pr.floor && pr.floor <= hi) return true;
+    }
+    return false;
+  }
+
+  function updatePolice(p, pr, dt, t, allPolice, myIndex) {
+    const wasOnLadder = p.on_ladder;
+    p.on_ladder = false; p.climbing = null;
+    p.vx = 0; p.vy = 0;
+    const curF = p.floor + 1;
+    const seesPrisoner = policeSeesPrisoner(p, pr);
+
+    // 检查情报是否失效（5秒内无发现则失效）
+    let intelValid = false;
+    if (lastKnownPrisonerFloor != null && lastKnownPrisonerX != null) {
+      if (t - lastIntelUpdateTime <= INTEL_EXPIRE_TIME) {
+        intelValid = true;
+      }
+    }
+
+    if (seesPrisoner) {
+      lastKnownPrisonerFloor = pr.floor;
+      lastKnownPrisonerX = pr.rect.centerx + (pr.vx || 0) * 0.28;
+      lastIntelUpdateTime = t;
+      intelValid = true;
+    }
+
+    const spread = 40;
+    const chaseOffset = (myIndex - 1) * spread;
+
+    let targetFloor0, targetX;
+    if (seesPrisoner || intelValid) {
+      // 有情报：追捕模式
+      p.mode = 'chase';
+      if (seesPrisoner) {
+        targetFloor0 = pr.floor;
+        targetX = (lastKnownPrisonerX || pr.rect.centerx) + chaseOffset;
+      } else {
+        targetFloor0 = lastKnownPrisonerFloor;
+        targetX = lastKnownPrisonerX + chaseOffset;
+      }
+    } else {
+      // 无情报：巡逻模式
+      p.mode = 'patrol';
+      // A: 3-4-5楼巡逻（floor index 2,3,4），B: 2-3-4楼巡逻（1,2,3），C: 1-2-3楼巡逻（0,1,2）
+      const patrolRanges = [[2, 3, 4], [1, 2, 3], [0, 1, 2]];
+      const [patrolMin, patrolMid, patrolMax] = patrolRanges[myIndex];
+      
+      if (p.floor < patrolMin) {
+        targetFloor0 = patrolMin;
+        targetX = CW / 2;
+      } else if (p.floor > patrolMax) {
+        targetFloor0 = patrolMax;
+        targetX = CW / 2;
+      } else {
+        if (p.floor === p.cSearchTarget && !wasOnLadder) {
+          if (p.cSearchGoingUp) {
+            if (p.cSearchTarget >= patrolMax) {
+              p.cSearchTarget = patrolMid;
+              p.cSearchGoingUp = false;
+            } else {
+              p.cSearchTarget++;
+            }
+          } else {
+            if (p.cSearchTarget <= patrolMin) {
+              p.cSearchTarget = patrolMid;
+              p.cSearchGoingUp = true;
+            } else {
+              p.cSearchTarget--;
+            }
+          }
+        }
+        targetFloor0 = p.cSearchTarget;
+        if (p.floor === targetFloor0) {
+          if (p.rect.x <= 40) p.patrolDir = 1;
+          if (p.rect.x >= CW - p.rect.w - 40) p.patrolDir = -1;
+          targetX = p.rect.centerx + p.patrolDir * 300;
+        } else {
+          targetX = CW / 2;
+        }
+      }
+    }
+
+    targetX = Math.max(30, Math.min(CW - 30, targetX));
+    const targetF = targetFloor0 + 1;
+
+    // 根据模式选择速度
+    let currentSpeed, currentLadderSpeed;
+    if (p.mode === 'patrol') {
+      currentSpeed = POLICE_PATROL_SPEED;
+      currentLadderSpeed = POLICE_LADDER;
+    } else if (p.mode === 'chase') {
+      currentSpeed = POLICE_CHASE_SPEED;
+      currentLadderSpeed = POLICE_LADDER;
+    } else {
+      currentSpeed = 0;
+      currentLadderSpeed = 0;
+    }
+
+    const occupiedLadderX = new Set();
+    for (let i = 0; i < allPolice.length; i++) {
+      if (i === myIndex) continue;
+      const other = allPolice[i];
+      if (other.climbing) occupiedLadderX.add(other.climbing.x);
+    }
+
+    const goalX = lastKnownPrisonerX != null ? lastKnownPrisonerX : targetX;
+
+    if (curF === targetF) {
+      const dx = targetX - p.rect.centerx;
+      if (Math.abs(dx) >= 8) {
+        if (dx < 0) p.vx = -currentSpeed;
+        else if (dx > 0) p.vx = currentSpeed;
+      } else if (seesPrisoner) {
+        const toward = pr.rect.centerx - p.rect.centerx;
+        if (toward < 0) p.vx = -currentSpeed;
+        else if (toward > 0) p.vx = currentSpeed;
+      }
+    } else {
+      const dir = targetF > curF ? 1 : -1;
+      let best = null, bestDist = 1e9;
+      for (const l of ladders) {
+        if (l.from !== curF && l.to !== curF) continue;
+        const next = l.from === curF ? l.to : l.from;
+        if ((next - curF) * dir <= 0) continue;
+        let dist = Math.abs(l.x - goalX) + Math.abs(l.x - p.rect.centerx);
+        if (occupiedLadderX.has(l.x)) dist += 400;
+        if (dist < bestDist) { bestDist = dist; best = l; }
+      }
+      if (best) {
+        const lr = ladderRect(best);
+        if (Math.abs(p.rect.centerx - lr.centerx) > 4)
+          p.vx = p.rect.centerx < lr.centerx ? currentSpeed : -currentSpeed;
+        else {
+          p.on_ladder = true;
+          p.climbing = best;
+          p.vy = (targetFloor0 > p.floor) ? -currentLadderSpeed : currentLadderSpeed;
+        }
+      }
+    }
+
+    p.rect.x = Math.max(0, Math.min(CW - p.rect.w, p.rect.x + p.vx * dt));
+
+    if (p.on_ladder && p.climbing) {
+      p.rect.y += p.vy * dt;
+      p.rect.centerx = p.climbing.x;
+      const topFloor = Math.max(p.climbing.from, p.climbing.to) - 1;
+      const bottomFloor = Math.min(p.climbing.from, p.climbing.to) - 1;
+      const nextF = p.vy < 0 ? topFloor : bottomFloor;
+      const targetY = FLOOR_Y(nextF) - p.rect.h;
+      if (p.vy < 0 && p.rect.top <= targetY) { p.rect.top = targetY; p.floor = nextF; p.on_ladder = false; p.climbing = null; }
+      else if (p.vy > 0 && p.rect.top >= targetY) { p.rect.top = targetY; p.floor = nextF; p.on_ladder = false; p.climbing = null; }
+    } else {
+      p.rect.bottom = FLOOR_Y(p.floor);
+    }
+  }
+
+  function tryPoliceShoot(t) {
+    for (const p of police) {
+      if (p.floor !== prisoner.floor) continue;
+      // 距离检查：必须大于10像素
+      const dist = Math.abs(p.rect.centerx - prisoner.rect.centerx);
+      if (dist <= POLICE_SHOOT_MIN_DISTANCE) continue;
+      // 冷却检查
+      if (t < p.last_shot + POLICE_COOLDOWN) continue;
+      // 射击：子弹速度等于逃犯奔跑速度
+      p.last_shot = t;
+      const vx = prisoner.rect.centerx > p.rect.centerx ? BULLET_SPEED : -BULLET_SPEED;
+      const bx = vx > 0 ? p.rect.right : p.rect.x - BULLET_W;
+      const r = rect(bx, p.rect.centery - BULLET_H/2, BULLET_W, BULLET_H);
+      bullets.push({ rect: r, vx, owner: 'police' });
+      playShoot();
+      return;
+    }
+  }
+
+  function updateBullets(dt) {
+    let hit = false;
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i];
+      b.rect.x += b.vx * dt;
+      if (b.rect.right < 0 || b.rect.left > CW) { bullets.splice(i, 1); continue; }
+      if (b.owner === 'police') {
+        if (b.rect.colliderect(prisoner.rect)) { hit = true; bullets.splice(i, 1); continue; }
+        for (const p of police) {
+          if (b.rect.colliderect(p.rect)) { bullets.splice(i, 1); break; }
+        }
+      }
+    }
+    return hit;
+  }
+
+  function draw() {
+    ctx.fillStyle = '#0a0a1e';
+    ctx.fillRect(0, 0, CW, CH);
+
+    ctx.strokeStyle = '#c8c8b4';
+    ctx.lineWidth = 6;
+    ctx.strokeRect(2, 2, CW - 4, CH - 4);
+
+    for (let i = 0; i < FLOOR_COUNT; i++) {
+      const y = FLOOR_Y(i);
+      ctx.strokeStyle = '#c8c8b4';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.moveTo(40, y);
+      ctx.lineTo(CW - 40, y);
+      ctx.stroke();
+      ctx.fillStyle = '#e6e6e6';
+      ctx.font = '16px sans-serif';
+      ctx.fillText(String(i + 1), 20, y - 8);
+    }
+
+    const LADDER_STEP = 18;
+    for (const l of ladders) {
+      const lr = ladderRect(l);
+      const top = lr.top, bottom = lr.bottom, left = lr.left, right = lr.right;
+      ctx.strokeStyle = '#b4b4ff';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(left, top);
+      ctx.lineTo(left, bottom);
+      ctx.moveTo(right, top);
+      ctx.lineTo(right, bottom);
+      ctx.stroke();
+      for (let y = top; y <= bottom; y += LADDER_STEP) {
+        ctx.beginPath();
+        ctx.moveTo(left, y);
+        ctx.lineTo(right, y);
+        ctx.stroke();
+      }
+    }
+
+    ctx.strokeStyle = '#ffc878';
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(slideStartX, FLOOR_Y(4));
+    ctx.lineTo(slideEndX, FLOOR_Y(0));
+    ctx.stroke();
+
+    for (const b of bullets) {
+      ctx.fillStyle = '#dc2828';
+      ctx.fillRect(b.rect.x, b.rect.y, b.rect.w, b.rect.h);
+    }
+
+    ctx.fillStyle = '#e6e6e6';
+    ctx.fillRect(prisoner.rect.x, prisoner.rect.y, prisoner.rect.w, prisoner.rect.h);
+    for (let y = prisoner.rect.y; y < prisoner.rect.bottom; y += 5) {
+      ctx.fillStyle = (Math.floor((y - prisoner.rect.y) / 5) % 2) ? '#282828' : '#e6e6e6';
+      ctx.fillRect(prisoner.rect.x, y, prisoner.rect.w, 5);
+    }
+
+    ctx.fillStyle = '#143ca0';
+    const labels = ['A', 'B', 'C'];
+    police.forEach((p, i) => {
+      ctx.fillRect(p.rect.x, p.rect.y, p.rect.w, p.rect.h);
+      ctx.fillStyle = '#e6e6e6';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(labels[i] || String(i + 1), p.rect.centerx, p.rect.centery);
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+      ctx.fillStyle = '#143ca0';
+    });
+
+    ui.textContent = `Time: ${Math.floor(elapsed)} s`;
+    if (gameOver) {
+      ctx.fillStyle = '#e6e6e6';
+      ctx.font = '28px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(winnerText, CW/2, FLOOR_Y(4) - 50);
+      ctx.textAlign = 'left';
+      restartBtn.style.display = 'block';
+      restartWrap.classList.add('active');
+    }
+  }
+
+  function loop(now) {
+    requestAnimationFrame(loop);
+    const dt = Math.min((now - lastTick) / 1000, 0.1);
+    lastTick = now;
+
+    if (gameOver) { draw(); return; }
+
+    elapsed = (performance.now() / 1000) - startTime;
+    const t = performance.now() / 1000;
+    if (t - lastSlideTime >= SLIDE_CHANGE) {
+      lastSlideTime = t;
+      slideStartX = 80 + Math.random() * (CW - 160);
+      slideEndX = 80 + Math.random() * (CW - 160);
+    }
+
+    updatePrisoner(prisoner, dt, t);
+    police.forEach((p, i) => updatePolice(p, prisoner, dt, t, police, i));
+    tryPoliceShoot(t);
+    const hit = updateBullets(dt);
+    if (hit) { playHit(); gameOver = true; winnerText = 'Police Won'; }
+    for (const p of police) {
+      if (p.rect.colliderect(prisoner.rect)) { gameOver = true; winnerText = 'Police Won'; break; }
+    }
+    if (!gameOver && elapsed >= WIN_TIME) { gameOver = true; winnerText = 'Prisoner Win'; playWin(); }
+
+    draw();
+  }
+
+  function start() {
+    initLadders();
+    prisoner = createPrisoner();
+    police = createPolice();
+    bullets = [];
+    gameOver = false;
+    winnerText = '';
+    startTime = performance.now() / 1000;
+    lastSlideTime = startTime;
+    lastKnownPrisonerFloor = null;
+    lastKnownPrisonerX = null;
+    lastIntelUpdateTime = -999;
+    for (const p of police) {
+      p.mode = 'patrol';
+    }
+    restartBtn.style.display = 'none';
+    restartWrap.classList.remove('active');
+  }
+
+  document.addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (e.code === 'Space') keys['Space'] = true;
+    if (e.key === ' ') { keys[' '] = true; e.preventDefault(); }
+  });
+  document.addEventListener('keyup', e => {
+    keys[e.key] = false;
+    if (e.code === 'Space') keys['Space'] = false;
+  });
+  restartBtn.addEventListener('click', start);
+
+  document.querySelectorAll('#touch .btn').forEach(btn => {
+    const key = btn.dataset.key;
+    const code = key === 'Left' ? 'ArrowLeft' : key === 'Right' ? 'ArrowRight' : key === 'Up' ? 'ArrowUp' : key === 'Down' ? 'ArrowDown' : ' ';
+    btn.addEventListener('touchstart', e => { e.preventDefault(); keys[code] = true; });
+    btn.addEventListener('touchend', e => { e.preventDefault(); keys[code] = false; });
+    btn.addEventListener('mousedown', () => keys[code] = true);
+    btn.addEventListener('mouseup', () => keys[code] = false);
+    btn.addEventListener('mouseleave', () => keys[code] = false);
+  });
+
+  lastTick = performance.now();
+  start();
+  requestAnimationFrame(loop);
+})();
+  </script>
+</body>
+</html>
